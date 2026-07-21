@@ -9,8 +9,9 @@ use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use interprocess::local_socket::{
-    tokio::prelude::LocalSocketStream, traits::tokio::Listener as _, GenericFilePath, ListenerOptions, Name,
-    ToFsName as _,
+    tokio::prelude::LocalSocketStream,
+    traits::{tokio::Listener as _, StreamCommon as _},
+    GenericFilePath, ListenerOptions, Name, ToFsName as _,
 };
 #[cfg(unix)]
 use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
@@ -132,6 +133,47 @@ pub struct ClientInfo {
     pub connection_id: u64,
     /// Connection establishment time
     pub connected_at: Instant,
+    /// Kernel-reported credentials for the connected peer.
+    pub peer_credentials: PeerCredentials,
+}
+
+/// Stable subset of platform peer credentials exposed to request handlers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerCredentials {
+    /// Effective Unix user ID. Unavailable on Windows.
+    pub uid: Option<u32>,
+    /// Effective Unix group ID. Unavailable on Windows.
+    pub gid: Option<u32>,
+}
+
+fn peer_credentials_from_stream(stream: &LocalSocketStream) -> Result<PeerCredentials> {
+    #[cfg(unix)]
+    {
+        let credentials = stream
+            .peer_creds()
+            .map_err(|error| KodeBridgeError::connection(format!("Failed to read peer credentials: {error}")))?;
+        let uid = credentials.euid();
+        let gid = credentials.egid().or_else(|| {
+            credentials
+                .groups()
+                .and_then(|groups| groups.first())
+                .copied()
+        });
+
+        if uid.is_none() || gid.is_none() {
+            return Err(KodeBridgeError::connection(
+                "Peer credentials did not include a Unix UID and GID".to_string(),
+            ));
+        }
+
+        Ok(PeerCredentials { uid, gid })
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = stream;
+        Ok(PeerCredentials::default())
+    }
 }
 
 /// Response builder for HTTP responses
@@ -542,6 +584,14 @@ impl IpcHttpServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok(stream) => {
+                            let peer_credentials = match peer_credentials_from_stream(&stream) {
+                                Ok(credentials) => credentials,
+                                Err(error) => {
+                                    drop(permit);
+                                    warn!("Rejected connection without peer credentials: {}", error);
+                                    continue;
+                                }
+                            };
                             let connection_id = self.stats.total_connections.fetch_add(1, Ordering::Relaxed) + 1;
                             self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -553,6 +603,7 @@ impl IpcHttpServer {
                                 if let Err(e) = Self::handle_connection(
                                     stream,
                                     connection_id,
+                                    peer_credentials,
                                     router,
                                     config,
                                     Arc::clone(&stats),
@@ -603,6 +654,7 @@ impl IpcHttpServer {
     async fn handle_connection(
         stream: LocalSocketStream,
         connection_id: u64,
+        peer_credentials: PeerCredentials,
         router: Arc<Router>,
         config: ServerConfig,
         stats: Arc<SharedStats>,
@@ -612,6 +664,7 @@ impl IpcHttpServer {
         let client_info = ClientInfo {
             connection_id,
             connected_at: Instant::now(),
+            peer_credentials,
         };
 
         let codec = HttpIpcCodec::new(config.max_header_size, config.max_request_size);
@@ -770,6 +823,7 @@ mod tests {
             client_info: ClientInfo {
                 connection_id: 1,
                 connected_at: Instant::now(),
+                peer_credentials: PeerCredentials::default(),
             },
             timestamp: Instant::now(),
             path_params: HashMap::new(),
@@ -879,6 +933,7 @@ mod tests {
             client_info: ClientInfo {
                 connection_id: 1,
                 connected_at: Instant::now(),
+                peer_credentials: PeerCredentials::default(),
             },
             timestamp: Instant::now(),
             path_params: HashMap::new(),
@@ -922,6 +977,7 @@ mod tests {
             client_info: ClientInfo {
                 connection_id: 1,
                 connected_at: Instant::now(),
+                peer_credentials: PeerCredentials::default(),
             },
             timestamp: Instant::now(),
             path_params: HashMap::new(),
@@ -935,5 +991,34 @@ mod tests {
 
         let response = (handler)(ctx).await.unwrap();
         assert_eq!(response.body.as_ref(), b"User ID: 123");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_stream_reports_kernel_peer_credentials() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+
+        let socket_path =
+            std::env::temp_dir().join(format!("kode-bridge-peer-credentials-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener_name = socket_path
+            .as_path()
+            .to_fs_name::<GenericFilePath>()?
+            .into_owned();
+        let listener = ListenerOptions::new()
+            .name(listener_name.clone())
+            .create_tokio()?;
+
+        let client = tokio::spawn(async move { LocalSocketStream::connect(listener_name).await });
+        let stream = listener.accept().await?;
+        let credentials = peer_credentials_from_stream(&stream)?;
+
+        assert_eq!(credentials.uid, Some(unsafe { libc::geteuid() }));
+        assert_eq!(credentials.gid, Some(unsafe { libc::getegid() }));
+
+        drop(stream);
+        drop(client.await??);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
     }
 }

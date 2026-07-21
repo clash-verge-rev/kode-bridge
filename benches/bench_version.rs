@@ -193,6 +193,7 @@ async fn server_pipeline_once(router: Arc<Router>, codec: &mut HttpIpcCodec, req
         client_info: ClientInfo {
             connection_id: 1,
             connected_at: Instant::now(),
+            peer_credentials: Default::default(),
         },
         timestamp: Instant::now(),
     };

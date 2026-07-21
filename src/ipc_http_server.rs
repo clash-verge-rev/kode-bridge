@@ -8,10 +8,11 @@ use crate::errors::{KodeBridgeError, Result};
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use http::{HeaderMap, Method, StatusCode, Uri};
+#[cfg(unix)]
+use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{
-    tokio::prelude::LocalSocketStream,
-    traits::{tokio::Listener as _, StreamCommon as _},
-    GenericFilePath, ListenerOptions, Name, ToFsName as _,
+    tokio::prelude::LocalSocketStream, traits::tokio::Listener as _, GenericFilePath, ListenerOptions, Name,
+    ToFsName as _,
 };
 #[cfg(unix)]
 use interprocess::os::unix::local_socket::ListenerOptionsExt as _;

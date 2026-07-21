@@ -33,6 +33,8 @@ pub struct ClientConfig {
     pub max_concurrent_requests: usize,
     /// Rate limiting: max requests per second
     pub max_requests_per_second: Option<f64>,
+    /// Require the connected Windows named-pipe server to run as LocalSystem.
+    pub require_windows_server_system: bool,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +47,7 @@ impl Default for ClientConfig {
             retry_delay: Duration::from_millis(25), // 减少重试延迟
             max_concurrent_requests: 16,            // 增加并发请求数
             max_requests_per_second: Some(50.0),    // 增加请求速率限制
+            require_windows_server_system: false,
         }
     }
 }
@@ -60,6 +63,8 @@ pub struct IpcHttpClient {
     retry_executor: RetryExecutor,
     /// 专门用于PUT请求的重试执行器
     put_retry_executor: RetryExecutor,
+    #[cfg(windows)]
+    path: std::path::PathBuf,
 }
 
 /// HTTP request builder for fluent API
@@ -177,7 +182,7 @@ impl IpcHttpClient {
             .map_err(|e| KodeBridgeError::configuration(format!("Invalid path: {}", e)))?
             .into_owned();
 
-        let pool = if config.enable_pooling {
+        let pool = if config.enable_pooling && !config.require_windows_server_system {
             Some(ConnectionPool::new(name.clone(), config.pool_config.clone()))
         } else {
             None
@@ -200,6 +205,8 @@ impl IpcHttpClient {
             pool,
             retry_executor,
             put_retry_executor,
+            #[cfg(windows)]
+            path: path.as_ref().to_path_buf(),
         })
     }
 
@@ -212,7 +219,16 @@ impl IpcHttpClient {
                 tokio::time::sleep(self.config.retry_delay).await;
             }
 
-            match LocalSocketStream::connect(self.name.clone()).await {
+            #[cfg(windows)]
+            let connection = if self.config.require_windows_server_system {
+                crate::windows_secure_pipe::connect_local_system_server(&self.path).await
+            } else {
+                LocalSocketStream::connect(self.name.clone()).await
+            };
+            #[cfg(not(windows))]
+            let connection = LocalSocketStream::connect(self.name.clone()).await;
+
+            match connection {
                 Ok(stream) => {
                     debug!("Created direct connection on attempt {}", attempt + 1);
                     return Ok(stream);
@@ -413,8 +429,6 @@ impl IpcHttpClient {
 
     /// Get a fresh connection optimized for PUT requests
     async fn get_fresh_connection(&self) -> Result<Either<PooledConnection, LocalSocketStream>> {
-        use interprocess::local_socket::tokio::prelude::LocalSocketStream;
-
         // 首先尝试从连接池获取新连接
         if let Some(ref pool) = self.pool {
             match tokio::time::timeout(Duration::from_millis(20), pool.get_fresh_connection()).await {
@@ -426,12 +440,7 @@ impl IpcHttpClient {
         }
 
         // 直接创建连接，使用更快的超时设置
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            LocalSocketStream::connect(self.name.clone()),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_millis(100), self.create_direct_connection()).await {
             Ok(Ok(stream)) => Ok(Either::Direct(stream)),
             Ok(Err(_)) | Err(_) => {
                 // 如果直接连接失败，回退到普通池化连接

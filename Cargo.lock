@@ -690,6 +690,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "widestring",
+ "windows-sys",
 ]
 
 [[package]]

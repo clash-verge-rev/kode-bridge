@@ -14,7 +14,7 @@ use interprocess::local_socket::{
     tokio::prelude::LocalSocketStream, traits::tokio::Listener as _, GenericFilePath, ListenerOptions, Name,
     ToFsName as _,
 };
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 #[cfg(windows)]
 use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
@@ -22,6 +22,8 @@ use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use interprocess::TryClone as _;
 use path_tree::PathTree;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     fmt,
@@ -470,6 +472,10 @@ impl fmt::Display for ServerStats {
 /// High-level HTTP IPC server
 pub struct IpcHttpServer {
     name: Name<'static>,
+    #[cfg(target_os = "macos")]
+    socket_path: PathBuf,
+    #[cfg(target_os = "macos")]
+    listener_mode: Option<libc::mode_t>,
     config: ServerConfig,
     listener_options: ListenerOptions<'static>,
     router: Arc<Router>,
@@ -480,8 +486,8 @@ pub struct IpcHttpServer {
 
 impl IpcHttpServer {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
         let name = path
-            .as_ref()
             .to_fs_name::<GenericFilePath>()
             .map_err(|e| KodeBridgeError::configuration(format!("Invalid server path: {}", e)))?
             .into_owned();
@@ -489,6 +495,10 @@ impl IpcHttpServer {
         let listener_options = ListenerOptions::new();
         Ok(Self {
             name,
+            #[cfg(target_os = "macos")]
+            socket_path: path.to_path_buf(),
+            #[cfg(target_os = "macos")]
+            listener_mode: None,
             config,
             listener_options,
             router: Arc::new(Router::new()),
@@ -499,8 +509,8 @@ impl IpcHttpServer {
     }
 
     pub fn with_config<P: AsRef<Path>>(path: P, config: ServerConfig) -> Result<Self> {
+        let path = path.as_ref();
         let name = path
-            .as_ref()
             .to_fs_name::<GenericFilePath>()
             .map_err(|e| KodeBridgeError::configuration(format!("Invalid server path: {}", e)))?
             .into_owned();
@@ -508,6 +518,10 @@ impl IpcHttpServer {
         let listener_options = ListenerOptions::new();
         Ok(Self {
             name,
+            #[cfg(target_os = "macos")]
+            socket_path: path.to_path_buf(),
+            #[cfg(target_os = "macos")]
+            listener_mode: None,
             config,
             listener_options,
             router: Arc::new(Router::new()),
@@ -522,7 +536,13 @@ impl IpcHttpServer {
         self
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    pub const fn with_listener_mode(mut self, mode: libc::mode_t) -> Self {
+        self.listener_mode = Some(mode);
+        self
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn with_listener_mode(mut self, mode: libc::mode_t) -> Self {
         self.listener_options = self.listener_options.mode(mode);
         self
@@ -553,11 +573,22 @@ impl IpcHttpServer {
     }
 
     pub async fn serve(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.listener_mode.is_some() {
+            crate::unix_listener_mode::validate_listener_parent(&self.socket_path)
+                .map_err(|error| KodeBridgeError::connection(format!("Failed to validate listener parent: {error}")))?;
+        }
+
         let listener_options = self.listener_options.try_clone()?;
         let listener = listener_options
             .name(self.name.clone())
             .create_tokio()
             .map_err(|e| KodeBridgeError::connection(format!("Failed to bind server: {}", e)))?;
+        #[cfg(target_os = "macos")]
+        if let Some(mode) = self.listener_mode {
+            crate::unix_listener_mode::apply_bound_socket_mode(&self.socket_path, mode)
+                .map_err(|error| KodeBridgeError::connection(format!("Failed to secure listener mode: {error}")))?;
+        }
         info!("🚀 HTTP IPC Server listening on {:?}", self.name);
 
         // TODO: Graceful shutdown handling with custom signal
@@ -992,6 +1023,40 @@ mod tests {
 
         let response = (handler)(ctx).await.unwrap();
         assert_eq!(response.body.as_ref(), b"User ID: 123");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_listener_mode_is_applied() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = std::env::temp_dir().join(format!("kode-bridge-http-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let socket = directory.join("service.sock");
+        let mut server = IpcHttpServer::new(&socket)?.with_listener_mode(0o666);
+        let mut task = tokio::spawn(async move { server.serve().await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !socket.exists() {
+                if task.is_finished() {
+                    let result = (&mut task).await.map_err(std::io::Error::other)?;
+                    return Err(std::io::Error::other(format!(
+                        "server exited before creating the socket: {result:?}",
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+        .await??;
+
+        assert_eq!(std::fs::symlink_metadata(&socket)?.permissions().mode() & 0o777, 0o666,);
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[cfg(unix)]

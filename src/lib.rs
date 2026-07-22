@@ -8,6 +8,8 @@ pub mod parser_cache;
 pub mod pool;
 pub mod response;
 pub mod retry;
+#[cfg(target_os = "macos")]
+mod unix_listener_mode;
 #[cfg(windows)]
 mod windows_secure_pipe;
 

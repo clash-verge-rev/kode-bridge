@@ -19,6 +19,13 @@ const FILE_READ_DATA: u32 = 0x0001;
 const FILE_WRITE_DATA: u32 = 0x0002;
 
 pub(crate) fn connect_local_system_server(path: &Path) -> io::Result<LocalSocketStream> {
+    connect_verified_server(path, verify_process_is_local_system)
+}
+
+pub(crate) fn connect_verified_server(
+    path: &Path,
+    verifier: fn(u32) -> io::Result<()>,
+) -> io::Result<LocalSocketStream> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
         return Err(io::Error::new(
@@ -43,18 +50,18 @@ pub(crate) fn connect_local_system_server(path: &Path) -> io::Result<LocalSocket
         return Err(io::Error::last_os_error());
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    verify_pipe_server_is_local_system(handle.as_raw_handle())?;
+    verify_pipe_server(handle.as_raw_handle(), verifier)?;
 
     let stream = interprocess::os::windows::named_pipe::local_socket::tokio::Stream::try_from(handle)?;
     Ok(LocalSocketStream::from(stream))
 }
 
-fn verify_pipe_server_is_local_system(pipe: *mut c_void) -> io::Result<()> {
+fn verify_pipe_server(pipe: *mut c_void, verifier: fn(u32) -> io::Result<()>) -> io::Result<()> {
     let mut process_id = 0_u32;
     if unsafe { GetNamedPipeServerProcessId(pipe, &mut process_id) } == 0 || process_id == 0 {
         return Err(io::Error::last_os_error());
     }
-    verify_process_is_local_system(process_id)
+    verifier(process_id)
 }
 
 fn verify_process_is_local_system(process_id: u32) -> io::Result<()> {

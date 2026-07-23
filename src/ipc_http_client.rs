@@ -35,6 +35,12 @@ pub struct ClientConfig {
     pub max_requests_per_second: Option<f64>,
     /// Require the connected Windows named-pipe server to run as LocalSystem.
     pub require_windows_server_system: bool,
+    /// Verify the process ID behind the actual connected Windows named-pipe handle.
+    ///
+    /// Supplying a verifier disables connection pooling so every connection is
+    /// checked before it is used.
+    #[cfg(windows)]
+    pub windows_server_pid_verifier: Option<fn(u32) -> std::io::Result<()>>,
 }
 
 impl Default for ClientConfig {
@@ -48,6 +54,8 @@ impl Default for ClientConfig {
             max_concurrent_requests: 16,            // 增加并发请求数
             max_requests_per_second: Some(50.0),    // 增加请求速率限制
             require_windows_server_system: false,
+            #[cfg(windows)]
+            windows_server_pid_verifier: None,
         }
     }
 }
@@ -182,7 +190,13 @@ impl IpcHttpClient {
             .map_err(|e| KodeBridgeError::configuration(format!("Invalid path: {}", e)))?
             .into_owned();
 
-        let pool = if config.enable_pooling && !config.require_windows_server_system {
+        #[cfg(windows)]
+        let requires_server_verification =
+            config.require_windows_server_system || config.windows_server_pid_verifier.is_some();
+        #[cfg(not(windows))]
+        let requires_server_verification = false;
+
+        let pool = if config.enable_pooling && !requires_server_verification {
             Some(ConnectionPool::new(name.clone(), config.pool_config.clone()))
         } else {
             None
@@ -220,7 +234,9 @@ impl IpcHttpClient {
             }
 
             #[cfg(windows)]
-            let connection = if self.config.require_windows_server_system {
+            let connection = if let Some(verifier) = self.config.windows_server_pid_verifier {
+                crate::windows_secure_pipe::connect_verified_server(&self.path, verifier)
+            } else if self.config.require_windows_server_system {
                 crate::windows_secure_pipe::connect_local_system_server(&self.path)
             } else {
                 LocalSocketStream::connect(self.name.clone()).await
@@ -669,5 +685,32 @@ enum Either<A, B> {
 impl Drop for IpcHttpClient {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{ClientConfig, IpcHttpClient};
+
+    fn require_nonzero_process_id(process_id: u32) -> std::io::Result<()> {
+        if process_id == 0 {
+            return Err(std::io::Error::other("missing process ID"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn custom_server_verification_disables_connection_pooling() -> crate::errors::Result<()> {
+        let client = IpcHttpClient::with_config(
+            r"\\.\pipe\kode-bridge-verifier-pool-test",
+            ClientConfig {
+                enable_pooling: true,
+                windows_server_pid_verifier: Some(require_nonzero_process_id),
+                ..Default::default()
+            },
+        )?;
+
+        assert!(client.pool.is_none());
+        Ok(())
     }
 }

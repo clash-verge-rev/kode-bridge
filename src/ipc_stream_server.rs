@@ -434,13 +434,24 @@ impl IpcStreamServer {
     /// Will panic if the SDDL string is invalid or cannot be parsed.
     ///
     /// # Example
-    /// ```rust
-    /// server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)"); // Allow Everyone access
+    /// ```no_run
+    /// use kode_bridge::IpcStreamServer;
+    ///
+    /// # fn configure() -> kode_bridge::Result<()> {
+    /// let server = IpcStreamServer::new(r"\\.\pipe\kode-bridge-example")?
+    ///     .with_listener_security_descriptor("D:(A;;GA;;;WD)"); // Allow Everyone access
+    /// # let _ = server;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// # Reference
     /// See [Microsoft SDDL documentation](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-string-format)
     #[cfg(windows)]
+    #[allow(
+        clippy::expect_used,
+        reason = "the infallible builder API documents invalid SDDL as a panic"
+    )]
     pub fn with_listener_security_descriptor(mut self, sddl: &str) -> Self {
         let sddl = U16CString::from_str(sddl).expect("Invalid SDDL string");
         let sd = SecurityDescriptor::deserialize(&sddl).expect("Failed to parse SDDL");

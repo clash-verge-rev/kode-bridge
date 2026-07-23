@@ -221,7 +221,7 @@ impl IpcHttpClient {
 
             #[cfg(windows)]
             let connection = if self.config.require_windows_server_system {
-                crate::windows_secure_pipe::connect_local_system_server(&self.path).await
+                crate::windows_secure_pipe::connect_local_system_server(&self.path)
             } else {
                 LocalSocketStream::connect(self.name.clone()).await
             };

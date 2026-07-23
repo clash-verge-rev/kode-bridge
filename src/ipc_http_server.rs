@@ -149,34 +149,26 @@ pub struct PeerCredentials {
     pub gid: Option<u32>,
 }
 
+#[cfg(unix)]
 fn peer_credentials_from_stream(stream: &LocalSocketStream) -> Result<PeerCredentials> {
-    #[cfg(unix)]
-    {
-        let credentials = stream
-            .peer_creds()
-            .map_err(|error| KodeBridgeError::connection(format!("Failed to read peer credentials: {error}")))?;
-        let uid = credentials.euid();
-        let gid = credentials.egid().or_else(|| {
-            credentials
-                .groups()
-                .and_then(|groups| groups.first())
-                .copied()
-        });
+    let credentials = stream
+        .peer_creds()
+        .map_err(|error| KodeBridgeError::connection(format!("Failed to read peer credentials: {error}")))?;
+    let uid = credentials.euid();
+    let gid = credentials.egid().or_else(|| {
+        credentials
+            .groups()
+            .and_then(|groups| groups.first())
+            .copied()
+    });
 
-        if uid.is_none() || gid.is_none() {
-            return Err(KodeBridgeError::connection(
-                "Peer credentials did not include a Unix UID and GID".to_string(),
-            ));
-        }
-
-        Ok(PeerCredentials { uid, gid })
+    if uid.is_none() || gid.is_none() {
+        return Err(KodeBridgeError::connection(
+            "Peer credentials did not include a Unix UID and GID".to_string(),
+        ));
     }
 
-    #[cfg(windows)]
-    {
-        let _ = stream;
-        Ok(PeerCredentials::default())
-    }
+    Ok(PeerCredentials { uid, gid })
 }
 
 /// Response builder for HTTP responses
@@ -549,6 +541,10 @@ impl IpcHttpServer {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::expect_used,
+        reason = "the infallible builder API documents invalid SDDL as a panic"
+    )]
     pub fn with_listener_security_descriptor(mut self, sddl: &str) -> Self {
         let sddl = U16CString::from_str(sddl).expect("Invalid SDDL string");
         let sd = SecurityDescriptor::deserialize(&sddl).expect("Failed to parse SDDL");
@@ -616,6 +612,7 @@ impl IpcHttpServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok(stream) => {
+                            #[cfg(unix)]
                             let peer_credentials = match peer_credentials_from_stream(&stream) {
                                 Ok(credentials) => credentials,
                                 Err(error) => {
@@ -624,6 +621,8 @@ impl IpcHttpServer {
                                     continue;
                                 }
                             };
+                            #[cfg(windows)]
+                            let peer_credentials = PeerCredentials::default();
                             let connection_id = self.stats.total_connections.fetch_add(1, Ordering::Relaxed) + 1;
                             self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
 

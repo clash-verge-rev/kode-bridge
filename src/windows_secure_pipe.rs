@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCE
 const FILE_READ_DATA: u32 = 0x0001;
 const FILE_WRITE_DATA: u32 = 0x0002;
 
-pub(crate) async fn connect_local_system_server(path: &Path) -> io::Result<LocalSocketStream> {
+pub(crate) fn connect_local_system_server(path: &Path) -> io::Result<LocalSocketStream> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
         return Err(io::Error::new(
@@ -45,8 +45,7 @@ pub(crate) async fn connect_local_system_server(path: &Path) -> io::Result<Local
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     verify_pipe_server_is_local_system(handle.as_raw_handle())?;
 
-    let stream = interprocess::os::windows::named_pipe::local_socket::tokio::Stream::try_from(handle)
-        .map_err(io::Error::other)?;
+    let stream = interprocess::os::windows::named_pipe::local_socket::tokio::Stream::try_from(handle)?;
     Ok(LocalSocketStream::from(stream))
 }
 
@@ -119,8 +118,10 @@ fn verify_process_is_local_system(process_id: u32) -> io::Result<()> {
 mod tests {
     #[test]
     fn rejects_a_non_system_server_process() {
-        let error = super::verify_process_is_local_system(std::process::id())
-            .expect_err("ordinary test process must not be trusted as the service");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let result = super::verify_process_is_local_system(std::process::id());
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
     }
 }

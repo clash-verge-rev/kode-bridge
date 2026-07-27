@@ -14,15 +14,13 @@ use interprocess::local_socket::{
     tokio::prelude::LocalSocketStream, traits::tokio::Listener as _, GenericFilePath, ListenerOptions, Name,
     ToFsName as _,
 };
-#[cfg(all(unix, not(target_os = "macos")))]
-use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 #[cfg(windows)]
 use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 #[cfg(windows)]
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use interprocess::TryClone as _;
 use path_tree::PathTree;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
@@ -464,7 +462,7 @@ impl fmt::Display for ServerStats {
 /// High-level HTTP IPC server
 pub struct IpcHttpServer {
     name: Name<'static>,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     socket_path: PathBuf,
     #[cfg(unix)]
     listener_mode: Option<libc::mode_t>,
@@ -487,7 +485,7 @@ impl IpcHttpServer {
         let listener_options = ListenerOptions::new();
         Ok(Self {
             name,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             socket_path: path.to_path_buf(),
             #[cfg(unix)]
             listener_mode: None,
@@ -510,7 +508,7 @@ impl IpcHttpServer {
         let listener_options = ListenerOptions::new();
         Ok(Self {
             name,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             socket_path: path.to_path_buf(),
             #[cfg(unix)]
             listener_mode: None,

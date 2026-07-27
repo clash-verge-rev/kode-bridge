@@ -466,7 +466,7 @@ pub struct IpcHttpServer {
     name: Name<'static>,
     #[cfg(target_os = "macos")]
     socket_path: PathBuf,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     listener_mode: Option<libc::mode_t>,
     config: ServerConfig,
     listener_options: ListenerOptions<'static>,
@@ -489,7 +489,7 @@ impl IpcHttpServer {
             name,
             #[cfg(target_os = "macos")]
             socket_path: path.to_path_buf(),
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             listener_mode: None,
             config,
             listener_options,
@@ -512,7 +512,7 @@ impl IpcHttpServer {
             name,
             #[cfg(target_os = "macos")]
             socket_path: path.to_path_buf(),
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             listener_mode: None,
             config,
             listener_options,
@@ -528,15 +528,16 @@ impl IpcHttpServer {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    /// Set the permission bits the listening socket must end up with.
+    ///
+    /// Applied by changing the bound socket, never by asking for it at bind time. A mode requested
+    /// at bind time is filtered by the process umask, so a server asking for `0o666` under the
+    /// usual `0o022` gets `0o644` and under a stricter one gets `0o600` — silently, and differently
+    /// on every host. Callers use this to decide who may connect, which is not a decision a umask
+    /// should get to override.
+    #[cfg(unix)]
     pub const fn with_listener_mode(mut self, mode: libc::mode_t) -> Self {
         self.listener_mode = Some(mode);
-        self
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn with_listener_mode(mut self, mode: libc::mode_t) -> Self {
-        self.listener_options = self.listener_options.mode(mode);
         self
     }
 
@@ -569,7 +570,7 @@ impl IpcHttpServer {
     }
 
     pub async fn serve(&mut self) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         if self.listener_mode.is_some() {
             crate::unix_listener_mode::validate_listener_parent(&self.socket_path)
                 .map_err(|error| KodeBridgeError::connection(format!("Failed to validate listener parent: {error}")))?;
@@ -580,7 +581,7 @@ impl IpcHttpServer {
             .name(self.name.clone())
             .create_tokio()
             .map_err(|e| KodeBridgeError::connection(format!("Failed to bind server: {}", e)))?;
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         if let Some(mode) = self.listener_mode {
             crate::unix_listener_mode::apply_bound_socket_mode(&self.socket_path, mode)
                 .map_err(|error| KodeBridgeError::connection(format!("Failed to secure listener mode: {error}")))?;
@@ -1024,10 +1025,21 @@ mod tests {
         assert_eq!(response.body.as_ref(), b"User ID: 123");
     }
 
-    #[cfg(target_os = "macos")]
+    /// The requested mode must survive a umask that would strip it.
+    ///
+    /// This is the whole point of applying the mode after the bind rather than at it. Asking the
+    /// listener to be created with `0o666` under the usual `0o022` umask silently produces `0o644`,
+    /// and under a stricter one `0o600` — which on Linux meant a service running as root published
+    /// a socket no unprivileged client could open, on every host, for as long as the two platforms
+    /// took different code paths here.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn macos_listener_mode_is_applied() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    async fn listener_mode_is_applied_despite_a_hostile_umask() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt as _;
+
+        // Restored before returning; the test is serial with respect to nothing else that binds.
+        let previous_umask = unsafe { libc::umask(0o077) };
+        let restore = scopeguard_umask(previous_umask);
 
         let directory = std::env::temp_dir().join(format!("kode-bridge-http-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -1051,11 +1063,31 @@ mod tests {
         })
         .await??;
 
-        assert_eq!(std::fs::symlink_metadata(&socket)?.permissions().mode() & 0o777, 0o666,);
+        assert_eq!(
+            std::fs::symlink_metadata(&socket)?.permissions().mode() & 0o777,
+            0o666,
+            "a umask must not be able to decide who may connect"
+        );
         task.abort();
         let _ = task.await;
         std::fs::remove_dir_all(directory)?;
+        drop(restore);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    struct RestoreUmask(libc::mode_t);
+
+    #[cfg(unix)]
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    #[cfg(unix)]
+    const fn scopeguard_umask(previous: libc::mode_t) -> RestoreUmask {
+        RestoreUmask(previous)
     }
 
     #[cfg(unix)]

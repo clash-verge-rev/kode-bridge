@@ -8,7 +8,21 @@ use std::{
     path::Path,
 };
 
+#[cfg(target_os = "macos")]
 const AT_SYMLINK_NOFOLLOW_ANY: libc::c_int = 0x0800;
+
+/// The flags `fchmodat` is given so that it refuses to follow a symlink.
+///
+/// Darwin has `AT_SYMLINK_NOFOLLOW_ANY` and honours `AT_SYMLINK_NOFOLLOW`. Linux honours neither
+/// here — `fchmodat` returns `ENOTSUP` for `AT_SYMLINK_NOFOLLOW` — so there the entry is changed
+/// directly, and what rules out a swapped symlink is the verification afterwards: it refuses
+/// anything that is not a socket, owned by this process, carrying exactly the requested mode. The
+/// parent has already been shown to be owned by the effective user and unwritable by group or
+/// other, so nothing unprivileged can put a symlink there to begin with.
+#[cfg(target_os = "macos")]
+const NO_FOLLOW_CHMOD_FLAGS: libc::c_int = libc::AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY;
+#[cfg(not(target_os = "macos"))]
+const NO_FOLLOW_CHMOD_FLAGS: libc::c_int = 0;
 
 fn invalid_path(error: NulError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
@@ -55,24 +69,41 @@ pub(crate) fn validate_listener_parent(path: &Path) -> io::Result<()> {
     open_secure_parent(path).map(|_| ())
 }
 
-pub(crate) fn apply_bound_socket_mode(path: &Path, mode: libc::mode_t) -> io::Result<()> {
-    let (parent, name) = open_secure_parent(path)?;
-    let flags = libc::AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY;
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, flags) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
+/// Stat an entry without following it, refusing anything that is not this process's own socket.
+fn require_own_socket(parent: &OwnedFd, name: &CString) -> io::Result<libc::stat> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if stat.st_uid != unsafe { libc::geteuid() }
-        || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
-        || stat.st_mode & 0o777 != mode & 0o777
-    {
+    if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "listener entry owner, type, or mode verification failed",
+            "listener entry owner or type verification failed",
+        ));
+    }
+    Ok(stat)
+}
+
+pub(crate) fn apply_bound_socket_mode(path: &Path, mode: libc::mode_t) -> io::Result<()> {
+    let (parent, name) = open_secure_parent(path)?;
+
+    // Checked before the change, not only after it. Where `fchmodat` cannot be told to refuse a
+    // symlink — Linux answers `ENOTSUP` to `AT_SYMLINK_NOFOLLOW` — it follows one instead, and
+    // would apply this mode to whatever the link points at. Noticing that afterwards is too late:
+    // the target has already been changed. What remains is the window between this check and the
+    // change, and only the effective user and root can create entries in a parent that
+    // `open_secure_parent` has already shown to be theirs and unwritable by anyone else.
+    require_own_socket(&parent, &name)?;
+
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, NO_FOLLOW_CHMOD_FLAGS) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let stat = require_own_socket(&parent, &name)?;
+    if stat.st_mode & 0o777 != mode & 0o777 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "listener entry mode verification failed",
         ));
     }
 

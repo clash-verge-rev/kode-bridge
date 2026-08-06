@@ -1,3 +1,12 @@
+//! Verifying and setting the permissions of a bound unix listener socket.
+//!
+//! Note on the `u32::from` around every file-mode comparison below: `stat::st_mode` and
+//! `mode_t` are not the same width on every target. On 32-bit Android `st_mode` is `u32`
+//! while `mode_t` — and so the `S_IF*` constants typed by it — is `u16`, and comparing the
+//! two directly does not compile there. `u32::from` widens both sides and is a no-op
+//! wherever they already agree, because `From<u32> for u32` exists; a plain `as` cast would
+//! work too but would silently keep compiling if one side ever narrowed.
+
 use std::{
     ffi::{CString, NulError},
     io,
@@ -53,7 +62,7 @@ fn open_secure_parent(path: &Path) -> io::Result<(OwnedFd, CString)> {
         return Err(io::Error::last_os_error());
     }
     if stat.st_uid != unsafe { libc::geteuid() }
-        || stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || u32::from(stat.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFDIR)
         || stat.st_mode & 0o022 != 0
     {
         return Err(io::Error::new(
@@ -75,7 +84,9 @@ fn require_own_socket(parent: &OwnedFd, name: &CString) -> io::Result<libc::stat
     if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+    if stat.st_uid != unsafe { libc::geteuid() }
+        || u32::from(stat.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFSOCK)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "listener entry owner or type verification failed",
@@ -100,7 +111,7 @@ pub(crate) fn apply_bound_socket_mode(path: &Path, mode: libc::mode_t) -> io::Re
     }
 
     let stat = require_own_socket(&parent, &name)?;
-    if stat.st_mode & 0o777 != mode & 0o777 {
+    if u32::from(stat.st_mode) & 0o777 != u32::from(mode) & 0o777 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "listener entry mode verification failed",
